@@ -101,7 +101,6 @@ button.danger:hover{background:#b91c1c}
 <button onclick="save()">💾 Export</button>
 <button class="secondary" onclick="clearServer()">🗑️ Clear</button>
 <button class="secondary" onclick="refreshStatus()">🔄 Refresh</button>
-# <button id="webhook-btn" onclick="setWebhook()" style="display:none">🔗 Set Webhook</button>
 </div>
 </div>
 
