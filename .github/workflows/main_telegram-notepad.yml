@@ -58,4 +58,4 @@ jobs:
         with:
           app-name: 'telegram-notepad'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_2CD6D4DE45214FDE898201A6F68A3CB9 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_6A69B8A535FC409E8DF7FF113E5B8DC9 }}
