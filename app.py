@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, Response
 import os
 import json
 from datetime import datetime
@@ -201,11 +201,28 @@ async function setWebhook(){
 
 async function save(){
   try {
-    const res = await fetch('/save', {method:'POST'});
-    const data = await res.json();
-    alert(data.message);
+    const res = await fetch('/save');
+    
+    if (res.ok) {
+      // Create a blob from the response and download it
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.style.display = 'none';
+      a.href = url;
+      a.download = 'messages.txt';
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      
+      alert('✅ Messages downloaded successfully!');
+    } else {
+      const errorData = await res.json();
+      alert('❌ ' + errorData.message);
+    }
   } catch (e) {
-    alert('Error saving: ' + e.message);
+    alert('❌ Error downloading: ' + e.message);
   }
 }
 
@@ -385,8 +402,8 @@ def api_clear():
     logger.info("Messages cleared via web interface")
     return ('', 204)
 
-@app.route('/save', methods=['POST'])
-def save_and_open():
+@app.route('/save', methods=['GET'])
+def save_and_download():
     with lock:
         if not messages:
             return jsonify({'message': 'No messages to save!'}), 400
@@ -395,14 +412,23 @@ def save_and_open():
                 for m in messages]
 
     try:
-        with open(SAVE_FILENAME, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
-        logger.info(f"Saved {len(lines)} messages to {SAVE_FILENAME}")
+        # Create the file content
+        file_content = ''.join(lines)
+        
+        logger.info(f"Downloading {len(lines)} messages as messages.txt")
 
-        return jsonify({'message': f'✅ Saved {len(lines)} messages to {SAVE_FILENAME}'})
+        # Return the file as a download
+        return Response(
+            file_content,
+            mimetype='text/plain',
+            headers={
+                'Content-Disposition': 'attachment; filename=messages.txt',
+                'Content-Type': 'text/plain; charset=utf-8'
+            }
+        )
     except Exception as e:
-        logger.error(f"Failed to save: {e}")
-        return jsonify({'message': f'❌ Error saving: {e}'}), 500
+        logger.error(f"Failed to create download: {e}")
+        return jsonify({'message': f'❌ Error creating download: {e}'}), 500
 
 # Telegram message handler
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
