@@ -1,6 +1,4 @@
-"""
-FIXED Telegram -> Notepad Flask app with proper async handling
-"""
+
 from flask import Flask, render_template_string, jsonify
 import os
 import threading
