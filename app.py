@@ -1,428 +1,128 @@
-from flask import Flask, render_template_string, jsonify, request
-import os
-import json
+import os, json, logging, asyncio
 from datetime import datetime
-from telegram import Update, Bot
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from threading import Lock
-import logging
+from flask import Flask, request, jsonify
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
-# Set up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Load environment variables
+# ---------- CONFIG -------------------------------------------------
 load_dotenv()
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    logger.error("❌ BOT_TOKEN not found in environment variables!")
-    exit(1)
+    raise RuntimeError("BOT_TOKEN env-var missing")
 
-logger.info(f"Bot token loaded: {BOT_TOKEN[:10]}...{BOT_TOKEN[-5:]}")
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"          # Telegram will POST here
+SAVE_FILE = "messages.txt"
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
-SAVE_FILENAME = 'messages.txt'
+# ---------- FLASK --------------------------------------------------
 app = Flask(__name__)
-
-# Thread-safe message storage
 messages = []
 lock = Lock()
 
-# Global variables
-bot_info = {}
-telegram_app = None
+# ---------- TELEGRAM HANDLERS --------------------------------------
+async def on_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text or "<non-text>"
+    log.info("📨 %s (%s): %s", user.full_name, user.id, text)
 
-# Initialize Telegram Application (but don't start polling)
-async def init_telegram_app():
-    global telegram_app, bot_info
-    try:
-        telegram_app = Application.builder().token(BOT_TOKEN).build()
-        telegram_app.add_handler(MessageHandler(filters.ALL, handle_message))
-        
-        # Initialize the application
-        await telegram_app.initialize()
-        
-        # Get bot info
-        bot = await telegram_app.bot.get_me()
-        bot_info = {
-            'username': bot.username,
-            'first_name': bot.first_name,
-            'id': bot.id
-        }
-        
-        logger.info(f"✅ Bot initialized: @{bot.username} ({bot.first_name})")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize bot: {e}")
-        return False
+    item = {
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "from": user.full_name or "Unknown",
+        "from_id": user.id,
+        "text": text,
+    }
+    with lock:
+        messages.append(item)
+    # optional persistent log
+    with open("messages_log.txt", "a", encoding="utf-8") as f:
+        f.write(f"[{item['time']}] {item['from']} ({item['from_id']}): {item['text']}\n")
 
-HTML_PAGE = '''<!doctype html>
-<html lang="en">
+# ---------- FLASK ROUTES -------------------------------------------
+@app.route("/")                       # human UI
+def index():
+    return """
+<!doctype html>
+<html>
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Telegram -> Notepad</title>
+<meta charset="utf-8"/>
+<title>Telegram → Notepad</title>
 <style>
-body { font-family: system-ui, -apple-system, sans-serif; background:#f8fafc; margin:0; padding:20px }
-.container { max-width:1000px;margin:0 auto;background:white;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08)}
-h1{margin-top:0;color:#1e293b}
-.status{padding:15px;margin:15px 0;border-radius:8px;font-weight:500}
-.status.success{background:#dcfce7;color:#166534;border:1px solid #bbf7d0}
-.status.error{background:#fee2e2;color:#dc2626;border:1px solid #fecaca}
-.status.info{background:#dbeafe;color:#1e40af;border:1px solid #bfdbfe}
-#msgs{height:450px;overflow:auto;border:2px solid #e5e7eb;padding:15px;border-radius:8px;background:#fefefe;font-family:monospace}
-.msg{padding:10px;border-bottom:1px solid #f1f5f9;margin-bottom:8px}
-.msg:last-child{border-bottom:none}
-.meta{font-size:12px;color:#64748b;margin-bottom:4px}
-.text{color:#1e293b;line-height:1.4}
-.controls{margin-top:20px;display:flex;gap:12px;flex-wrap:wrap}
-button{background:#3b82f6;color:white;border:none;padding:12px 20px;border-radius:8px;cursor:pointer;font-weight:500}
-button:hover{background:#2563eb}
-button.secondary{background:#6b7280}
-button.secondary:hover{background:#4b5563}
-button.danger{background:#dc2626}
-button.danger:hover{background:#b91c1c}
-.empty{color:#64748b;font-style:italic;text-align:center;padding:40px}
-.webhook-info{background:#f3f4f6;padding:15px;border-radius:8px;margin:15px 0;font-family:monospace;font-size:14px}
+body{font-family:system-ui;background:#f8fafc;margin:0;padding:20px}
+.container{max-width:900px;margin:auto;background:white;padding:25px;border-radius:10px;box-shadow:0 4px 18px rgba(0,0,0,.08)}
+h1{margin-top:0}
+#msgs{height:400px;border:1px solid #ddd;padding:10px;overflow:auto;font-family:monospace}
+button{margin-top:15px;padding:10px 18px;border:none;border-radius:6px;background:#3b82f6;color:white;cursor:pointer}
 </style>
 </head>
 <body>
 <div class="container">
 <h1>📱 Telegram → 📝 Notepad</h1>
-<div id="status" class="status info">🔄 Checking bot status...</div>
-<div id="bot-info" style="display:none" class="status info"></div>
-<div id="webhook-info" style="display:none" class="webhook-info"></div>
-<div id="msgs"></div>
-<div class="controls">
-<button onclick="save()">💾 Export</button>
-<button class="secondary" onclick="clearServer()">🗑️ Clear</button>
-<button class="secondary" onclick="refreshStatus()">🔄 Refresh</button>
-<button id="webhook-btn" onclick="setWebhook()" style="display:none">🔗 Set Webhook</button>
+<div id="msgs">Loading…</div>
+<button onclick="saveTxt()">💾 Save to disk</button>
+<button onclick="clearAll()">🗑️ Clear</button>
 </div>
-</div>
-
 <script>
-let messageCount = 0;
-
-async function fetchMsgs(){
-  try {
-    const res = await fetch('/api/messages');
-    const data = await res.json();
-    const container = document.getElementById('msgs');
-    
-    if (data.messages.length === 0) {
-      container.innerHTML = '<div class="empty">No messages yet<br><br>📱 Go to Telegram and:<br>1. Find your bot<br>2. Click START<br>3. Send a message</div>';
-    } else {
-      if (data.messages.length !== messageCount) {
-        messageCount = data.messages.length;
-        console.log(`📨 ${messageCount} messages loaded`);
-      }
-      
-      container.innerHTML = data.messages.map((m, i) => 
-        `<div class="msg">
-          <div class="meta">#${i+1} • ${m.time} • <strong>${m.from}</strong> (ID: ${m.from_id})</div>
-          <div class="text">${m.text}</div>
-        </div>`
-      ).join('');
-      container.scrollTop = container.scrollHeight;
-    }
-  } catch (e) {
-    console.error('❌ Error fetching messages:', e);
-  }
-}
-
-async function refreshStatus(){
-  const statusEl = document.getElementById('status');
-  const botInfoEl = document.getElementById('bot-info');
-  const webhookInfoEl = document.getElementById('webhook-info');
-  const webhookBtn = document.getElementById('webhook-btn');
-  
-  statusEl.innerHTML = '🔄 Checking...';
-  statusEl.className = 'status info';
-  
-  try {
-    const res = await fetch('/api/bot-status');
-    const data = await res.json();
-    
-    if (data.connected) {
-      statusEl.innerHTML = '✅ Bot is running and listening for messages';
-      statusEl.className = 'status success';
-      
-      botInfoEl.innerHTML = `🤖 Bot: <strong>@${data.username}</strong> (${data.first_name}) • Messages: ${data.message_count}`;
-      botInfoEl.style.display = 'block';
-      botInfoEl.className = 'status info';
-      
-      if (data.webhook_info) {
-        webhookInfoEl.innerHTML = `🔗 Webhook: ${data.webhook_info.url || 'Not set'}<br>📊 Pending updates: ${data.webhook_info.pending_update_count || 0}`;
-        webhookInfoEl.style.display = 'block';
-      }
-      
-      if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-        webhookBtn.style.display = 'inline-block';
-      }
-    } else {
-      statusEl.innerHTML = `❌ Bot error: ${data.error}`;
-      statusEl.className = 'status error';
-      botInfoEl.style.display = 'none';
-      webhookInfoEl.style.display = 'none';
-    }
-  } catch (e) {
-    statusEl.innerHTML = '❌ Cannot connect to server';
-    statusEl.className = 'status error';
-  }
-}
-
-async function setWebhook(){
-  const webhookBtn = document.getElementById('webhook-btn');
-  const originalText = webhookBtn.innerHTML;
-  webhookBtn.innerHTML = '⏳ Setting...';
-  webhookBtn.disabled = true;
-  
-  try {
-    const res = await fetch('/api/set-webhook', {method:'POST'});
-    const data = await res.json();
-    
-    if (data.success) {
-      alert('✅ Webhook set successfully! Your bot should now work.');
-      refreshStatus();
-    } else {
-      alert('❌ Failed to set webhook: ' + data.error);
-    }
-  } catch (e) {
-    alert('❌ Error setting webhook: ' + e.message);
-  } finally {
-    webhookBtn.innerHTML = originalText;
-    webhookBtn.disabled = false;
-  }
-}
-
-async function save(){
-  try {
-    const res = await fetch('/save', {method:'POST'});
-    const data = await res.json();
-    alert(data.message);
-  } catch (e) {
-    alert('Error saving: ' + e.message);
-  }
-}
-
-async function clearServer(){
-  if(!confirm('Clear all messages? This cannot be undone.')) return;
-  try {
-    await fetch('/api/clear', {method:'POST'});
-    messageCount = 0;
-    await fetchMsgs();
-    await refreshStatus();
-  } catch (e) {
-    alert('Error clearing: ' + e.message);
-  }
-}
-
-// Auto-refresh every 2 seconds
-setInterval(() => {
-  fetchMsgs();
-}, 2000);
-
-// Initial load
-refreshStatus();
-fetchMsgs();
+async function load(){ const r=await fetch("/api/messages"); const d=await r.json(); const box=document.getElementById("msgs"); box.innerHTML=d.messages.map((m,i)=>`<div><b>${i+1}.</b> [${m.time}] <b>${m.from}</b>: ${m.text}</div>`).join("")||"<em>No messages yet</em>"; }
+async function saveTxt(){ await fetch("/save",{method:"POST"}); alert("Saved to messages.txt"); }
+async function clearAll(){ if(!confirm("Clear all?"))return; await fetch("/api/clear",{method:"POST"}); load(); }
+setInterval(load,2000); load();
 </script>
 </body>
-</html>'''
+</html>
+"""
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_PAGE)
-
-@app.route('/webhook', methods=['POST'])
+@app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
-    """Handle incoming webhooks from Telegram"""
+    """Telegram delivers updates here"""
     try:
-        if not telegram_app:
-            logger.error("Telegram app not initialized")
-            return "Bot not ready", 400
-            
-        # Get the JSON data
-        json_data = request.get_json()
-        if not json_data:
-            return "No JSON data", 400
-        
-        logger.info(f"📨 Received webhook: {json_data}")
-        
-        # Create Update object
-        update = Update.de_json(json_data, telegram_app.bot)
-        
-        # Process the update
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(telegram_app.process_update(update))
-        finally:
-            loop.close()
-        
+        update = Update.de_json(request.get_json(force=True), bot)
+        asyncio.run(on_msg(update, None))
         return "OK", 200
-        
     except Exception as e:
-        logger.error(f"❌ Webhook error: {e}")
-        return f"Error: {str(e)}", 500
+        log.exception("webhook error")
+        return "ERR", 500
 
-@app.route('/api/messages')
+@app.route("/api/messages")
 def api_messages():
     with lock:
-        return jsonify({'messages': list(messages)})
+        return jsonify(messages=list(messages))
 
-@app.route('/api/bot-status')
-def api_bot_status():
-    """Check bot status"""
-    try:
-        with lock:
-            msg_count = len(messages)
-        
-        if bot_info and telegram_app:
-            # Get webhook info
-            webhook_info = {}
-            try:
-                import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    webhook_data = loop.run_until_complete(telegram_app.bot.get_webhook_info())
-                    webhook_info = {
-                        'url': webhook_data.url,
-                        'pending_update_count': webhook_data.pending_update_count
-                    }
-                finally:
-                    loop.close()
-            except Exception as e:
-                logger.error(f"Error getting webhook info: {e}")
-            
-            return jsonify({
-                'connected': True,
-                'username': bot_info.get('username', 'Unknown'),
-                'first_name': bot_info.get('first_name', 'Unknown'),
-                'message_count': msg_count,
-                'webhook_info': webhook_info
-            })
-        else:
-            return jsonify({
-                'connected': False,
-                'error': 'Bot not initialized yet'
-            })
-    except Exception as e:
-        return jsonify({
-            'connected': False,
-            'error': str(e)
-        })
-
-@app.route('/api/set-webhook', methods=['POST'])
-def api_set_webhook():
-    """Set webhook URL"""
-    try:
-        if not telegram_app:
-            return jsonify({'success': False, 'error': 'Bot not initialized'})
-        
-        # Get the current host
-        webhook_url = request.url_root.rstrip('/') + '/webhook'
-        logger.info(f"Setting webhook to: {webhook_url}")
-        
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            # Remove existing webhook first
-            loop.run_until_complete(telegram_app.bot.delete_webhook())
-            # Set new webhook
-            result = loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url))
-            
-            if result:
-                logger.info(f"✅ Webhook set successfully to {webhook_url}")
-                return jsonify({'success': True, 'webhook_url': webhook_url})
-            else:
-                return jsonify({'success': False, 'error': 'Failed to set webhook'})
-        finally:
-            loop.close()
-            
-    except Exception as e:
-        logger.error(f"❌ Error setting webhook: {e}")
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/clear', methods=['POST'])
+@app.route("/api/clear", methods=["POST"])
 def api_clear():
+    global messages
     with lock:
-        messages.clear()
-    logger.info("Messages cleared via web interface")
-    return ('', 204)
+        messages = []
+    return "", 204
 
-@app.route('/save', methods=['POST'])
-def save_and_open():
+@app.route("/save", methods=["POST"])
+def save():
     with lock:
         if not messages:
-            return jsonify({'message': 'No messages to save!'}), 400
-            
-        lines = [f"[{m['time']}] {m['from']} (ID: {m['from_id']}): {m['text']}\n" 
-                for m in messages]
+            return jsonify(message="Nothing to save"), 400
+        lines = [f"[{m['time']}] {m['from']} ({m['from_id']}): {m['text']}\n" for m in messages]
+    with open(SAVE_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    return jsonify(message=f"Saved {len(lines)} lines to {SAVE_FILE}")
 
-    try:
-        with open(SAVE_FILENAME, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
-        logger.info(f"Saved {len(lines)} messages to {SAVE_FILENAME}")
+@app.route("/api/set-webhook", methods=["POST"])
+def set_webhook():
+    """One-click webhook registration"""
+    url = request.url_root.rstrip("/") + WEBHOOK_PATH
+    ok = asyncio.run(bot.set_webhook(url=url))
+    if ok:
+        log.info("✅ webhook registered → %s", url)
+        return jsonify(success=True, webhook_url=url)
+    return jsonify(success=False, error="Telegram refused"), 400
 
-        return jsonify({'message': f'✅ Saved {len(lines)} messages to {SAVE_FILENAME}'})
-    except Exception as e:
-        logger.error(f"Failed to save: {e}")
-        return jsonify({'message': f'❌ Error saving: {e}'}), 500
+# ---------- START-UP ------------------------------------------------
+bot = Application.builder().token(BOT_TOKEN).build().bot  # lightweight bot instance
 
-# Telegram message handler
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming Telegram messages"""
-    try:
-        user = update.effective_user
-        message_text = update.message.text if update.message and update.message.text else '<non-text>'
-        
-        logger.info(f"📨 Message from {user.full_name} (@{user.username}): {message_text}")
-        
-        item = {
-            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'from': user.full_name or 'Unknown',
-            'from_id': user.id,
-            'text': message_text
-        }
-        
-        with lock:
-            messages.append(item)
-            total_messages = len(messages)
-        
-        logger.info(f"📝 Added to queue. Total messages: {total_messages}")
-        
-        # Save to persistent log
-        try:
-            with open('messages_log.txt', 'a', encoding='utf-8') as f:
-                f.write(f"[{item['time']}] {item['from']} (ID: {item['from_id']}): {item['text']}\n")
-        except Exception as e:
-            logger.error(f"Failed to write log: {e}")
-            
-    except Exception as e:
-        logger.error(f"Error handling message: {e}")
-
-# Initialize the Telegram app when the module loads
-import asyncio
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-try:
-    success = loop.run_until_complete(init_telegram_app())
-    if success:
-        logger.info("🚀 Telegram bot initialized successfully")
-    else:
-        logger.error("❌ Failed to initialize Telegram bot")
-finally:
-    loop.close()
-
-if __name__ == '__main__':
-    logger.info("🎬 Starting Flask application...")
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+# Azure App Service starts gunicorn with `--bind=0.0.0.0:$PORT`
+if __name__ == "__main__":          # local dev only
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
