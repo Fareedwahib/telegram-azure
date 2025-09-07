@@ -1,13 +1,10 @@
-
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 import os
-import threading
-import subprocess
+import json
 from datetime import datetime
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from threading import Lock
-import asyncio
 import logging
 from dotenv import load_dotenv
 
@@ -23,7 +20,7 @@ load_dotenv()
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
 if not BOT_TOKEN:
-    logger.error("❌ BOT_TOKEN not found in .env file!")
+    logger.error("❌ BOT_TOKEN not found in environment variables!")
     exit(1)
 
 logger.info(f"Bot token loaded: {BOT_TOKEN[:10]}...{BOT_TOKEN[-5:]}")
@@ -35,8 +32,33 @@ app = Flask(__name__)
 messages = []
 lock = Lock()
 
-# Global variable to store bot info
+# Global variables
 bot_info = {}
+telegram_app = None
+
+# Initialize Telegram Application (but don't start polling)
+async def init_telegram_app():
+    global telegram_app, bot_info
+    try:
+        telegram_app = Application.builder().token(BOT_TOKEN).build()
+        telegram_app.add_handler(MessageHandler(filters.ALL, handle_message))
+        
+        # Initialize the application
+        await telegram_app.initialize()
+        
+        # Get bot info
+        bot = await telegram_app.bot.get_me()
+        bot_info = {
+            'username': bot.username,
+            'first_name': bot.first_name,
+            'id': bot.id
+        }
+        
+        logger.info(f"✅ Bot initialized: @{bot.username} ({bot.first_name})")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize bot: {e}")
+        return False
 
 HTML_PAGE = '''<!doctype html>
 <html lang="en">
@@ -62,7 +84,10 @@ button{background:#3b82f6;color:white;border:none;padding:12px 20px;border-radiu
 button:hover{background:#2563eb}
 button.secondary{background:#6b7280}
 button.secondary:hover{background:#4b5563}
+button.danger{background:#dc2626}
+button.danger:hover{background:#b91c1c}
 .empty{color:#64748b;font-style:italic;text-align:center;padding:40px}
+.webhook-info{background:#f3f4f6;padding:15px;border-radius:8px;margin:15px 0;font-family:monospace;font-size:14px}
 </style>
 </head>
 <body>
@@ -70,11 +95,13 @@ button.secondary:hover{background:#4b5563}
 <h1>📱 Telegram → 📝 Notepad</h1>
 <div id="status" class="status info">🔄 Checking bot status...</div>
 <div id="bot-info" style="display:none" class="status info"></div>
+<div id="webhook-info" style="display:none" class="webhook-info"></div>
 <div id="msgs"></div>
 <div class="controls">
 <button onclick="save()">💾 Export</button>
 <button class="secondary" onclick="clearServer()">🗑️ Clear</button>
-<button class="secondary" onclick="refreshStatus()">🔄 Refresh </button>
+<button class="secondary" onclick="refreshStatus()">🔄 Refresh</button>
+<button id="webhook-btn" onclick="setWebhook()" style="display:none">🔗 Set Webhook</button>
 </div>
 </div>
 
@@ -111,6 +138,8 @@ async function fetchMsgs(){
 async function refreshStatus(){
   const statusEl = document.getElementById('status');
   const botInfoEl = document.getElementById('bot-info');
+  const webhookInfoEl = document.getElementById('webhook-info');
+  const webhookBtn = document.getElementById('webhook-btn');
   
   statusEl.innerHTML = '🔄 Checking...';
   statusEl.className = 'status info';
@@ -126,14 +155,48 @@ async function refreshStatus(){
       botInfoEl.innerHTML = `🤖 Bot: <strong>@${data.username}</strong> (${data.first_name}) • Messages: ${data.message_count}`;
       botInfoEl.style.display = 'block';
       botInfoEl.className = 'status info';
+      
+      if (data.webhook_info) {
+        webhookInfoEl.innerHTML = `🔗 Webhook: ${data.webhook_info.url || 'Not set'}<br>📊 Pending updates: ${data.webhook_info.pending_update_count || 0}`;
+        webhookInfoEl.style.display = 'block';
+      }
+      
+      if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+        webhookBtn.style.display = 'inline-block';
+      }
     } else {
       statusEl.innerHTML = `❌ Bot error: ${data.error}`;
       statusEl.className = 'status error';
       botInfoEl.style.display = 'none';
+      webhookInfoEl.style.display = 'none';
     }
   } catch (e) {
     statusEl.innerHTML = '❌ Cannot connect to server';
     statusEl.className = 'status error';
+  }
+}
+
+async function setWebhook(){
+  const webhookBtn = document.getElementById('webhook-btn');
+  const originalText = webhookBtn.innerHTML;
+  webhookBtn.innerHTML = '⏳ Setting...';
+  webhookBtn.disabled = true;
+  
+  try {
+    const res = await fetch('/api/set-webhook', {method:'POST'});
+    const data = await res.json();
+    
+    if (data.success) {
+      alert('✅ Webhook set successfully! Your bot should now work.');
+      refreshStatus();
+    } else {
+      alert('❌ Failed to set webhook: ' + data.error);
+    }
+  } catch (e) {
+    alert('❌ Error setting webhook: ' + e.message);
+  } finally {
+    webhookBtn.innerHTML = originalText;
+    webhookBtn.disabled = false;
   }
 }
 
@@ -175,6 +238,39 @@ fetchMsgs();
 def index():
     return render_template_string(HTML_PAGE)
 
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming webhooks from Telegram"""
+    try:
+        if not telegram_app:
+            logger.error("Telegram app not initialized")
+            return "Bot not ready", 400
+            
+        # Get the JSON data
+        json_data = request.get_json()
+        if not json_data:
+            return "No JSON data", 400
+        
+        logger.info(f"📨 Received webhook: {json_data}")
+        
+        # Create Update object
+        update = Update.de_json(json_data, telegram_app.bot)
+        
+        # Process the update
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(telegram_app.process_update(update))
+        finally:
+            loop.close()
+        
+        return "OK", 200
+        
+    except Exception as e:
+        logger.error(f"❌ Webhook error: {e}")
+        return f"Error: {str(e)}", 500
+
 @app.route('/api/messages')
 def api_messages():
     with lock:
@@ -187,12 +283,30 @@ def api_bot_status():
         with lock:
             msg_count = len(messages)
         
-        if bot_info:
+        if bot_info and telegram_app:
+            # Get webhook info
+            webhook_info = {}
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    webhook_data = loop.run_until_complete(telegram_app.bot.get_webhook_info())
+                    webhook_info = {
+                        'url': webhook_data.url,
+                        'pending_update_count': webhook_data.pending_update_count
+                    }
+                finally:
+                    loop.close()
+            except Exception as e:
+                logger.error(f"Error getting webhook info: {e}")
+            
             return jsonify({
                 'connected': True,
                 'username': bot_info.get('username', 'Unknown'),
                 'first_name': bot_info.get('first_name', 'Unknown'),
-                'message_count': msg_count
+                'message_count': msg_count,
+                'webhook_info': webhook_info
             })
         else:
             return jsonify({
@@ -204,6 +318,38 @@ def api_bot_status():
             'connected': False,
             'error': str(e)
         })
+
+@app.route('/api/set-webhook', methods=['POST'])
+def api_set_webhook():
+    """Set webhook URL"""
+    try:
+        if not telegram_app:
+            return jsonify({'success': False, 'error': 'Bot not initialized'})
+        
+        # Get the current host
+        webhook_url = request.url_root.rstrip('/') + '/webhook'
+        logger.info(f"Setting webhook to: {webhook_url}")
+        
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Remove existing webhook first
+            loop.run_until_complete(telegram_app.bot.delete_webhook())
+            # Set new webhook
+            result = loop.run_until_complete(telegram_app.bot.set_webhook(url=webhook_url))
+            
+            if result:
+                logger.info(f"✅ Webhook set successfully to {webhook_url}")
+                return jsonify({'success': True, 'webhook_url': webhook_url})
+            else:
+                return jsonify({'success': False, 'error': 'Failed to set webhook'})
+        finally:
+            loop.close()
+            
+    except Exception as e:
+        logger.error(f"❌ Error setting webhook: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/clear', methods=['POST'])
 def api_clear():
@@ -226,11 +372,7 @@ def save_and_open():
             f.writelines(lines)
         logger.info(f"Saved {len(lines)} messages to {SAVE_FILENAME}")
 
-        if os.name == 'nt':  # Windows
-            subprocess.Popen(['notepad.exe', SAVE_FILENAME])
-            return jsonify({'message': f'✅ Saved {len(lines)} messages and opened in Notepad'})
-        else:
-            return jsonify({'message': f'✅ Saved {len(lines)} messages to {SAVE_FILENAME}'})
+        return jsonify({'message': f'✅ Saved {len(lines)} messages to {SAVE_FILENAME}'})
     except Exception as e:
         logger.error(f"Failed to save: {e}")
         return jsonify({'message': f'❌ Error saving: {e}'}), 500
@@ -267,62 +409,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error handling message: {e}")
 
-def run_telegram_bot():
-    """Run the Telegram bot in a separate thread"""
-    async def start_bot():
-        try:
-            logger.info("🚀 Starting Telegram bot...")
-            
-            # Create application
-            app_bot = Application.builder().token(BOT_TOKEN).build()
-            
-            # Add message handler for ALL message types
-            app_bot.add_handler(MessageHandler(filters.ALL, handle_message))
-            
-            # Initialize and start
-            await app_bot.initialize()
-            await app_bot.start()
-            
-            # Get bot info
-            bot = await app_bot.bot.get_me()
-            global bot_info
-            bot_info = {
-                'username': bot.username,
-                'first_name': bot.first_name,
-                'id': bot.id
-            }
-            
-            logger.info(f"✅ Bot connected: @{bot.username} ({bot.first_name})")
-            logger.info("📱 Bot is now listening for messages...")
-            logger.info(f"💡 Go to https://t.me/{bot.username} to send messages")
-            
-            # Start polling
-            await app_bot.updater.start_polling(drop_pending_updates=True)
-            
-            # Keep running
-            try:
-                while True:
-                    await asyncio.sleep(1)
-            except KeyboardInterrupt:
-                logger.info("👋 Shutting down bot...")
-            finally:
-                await app_bot.updater.stop()
-                await app_bot.stop()
-                await app_bot.shutdown()
-                
-        except Exception as e:
-            logger.error(f"❌ Bot failed to start: {e}")
-
-    # Run the async function
-    asyncio.run(start_bot())
+# Initialize the Telegram app when the module loads
+import asyncio
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+try:
+    success = loop.run_until_complete(init_telegram_app())
+    if success:
+        logger.info("🚀 Telegram bot initialized successfully")
+    else:
+        logger.error("❌ Failed to initialize Telegram bot")
+finally:
+    loop.close()
 
 if __name__ == '__main__':
-    logger.info("🎬 Starting application...")
-    
-    # Start Telegram bot in background thread
-    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-    bot_thread.start()
-    
-    # Start Flask web server
-    logger.info("🌐 Starting web server at http://localhost:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    logger.info("🎬 Starting Flask application...")
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
