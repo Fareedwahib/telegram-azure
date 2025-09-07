@@ -35,11 +35,14 @@ lock = Lock()
 # Global variables
 bot_info = {}
 telegram_app = None
+initialization_complete = False
+initialization_error = None
 
 # Initialize Telegram Application (but don't start polling)
 async def init_telegram_app():
-    global telegram_app, bot_info
+    global telegram_app, bot_info, initialization_complete, initialization_error
     try:
+        logger.info("🔄 Initializing Telegram bot...")
         telegram_app = Application.builder().token(BOT_TOKEN).build()
         telegram_app.add_handler(MessageHandler(filters.ALL, handle_message))
         
@@ -54,9 +57,13 @@ async def init_telegram_app():
             'id': bot.id
         }
         
+        initialization_complete = True
+        initialization_error = None
         logger.info(f"✅ Bot initialized: @{bot.username} ({bot.first_name})")
         return True
     except Exception as e:
+        initialization_error = str(e)
+        initialization_complete = True  # Mark as complete even if failed
         logger.error(f"❌ Failed to initialize bot: {e}")
         return False
 
@@ -74,6 +81,7 @@ h1{margin-top:0;color:#1e293b}
 .status.success{background:#dcfce7;color:#166534;border:1px solid #bbf7d0}
 .status.error{background:#fee2e2;color:#dc2626;border:1px solid #fecaca}
 .status.info{background:#dbeafe;color:#1e40af;border:1px solid #bfdbfe}
+.status.warning{background:#fef3c7;color:#92400e;border:1px solid #fde68a}
 #msgs{height:450px;overflow:auto;border:2px solid #e5e7eb;padding:15px;border-radius:8px;background:#fefefe;font-family:monospace}
 .msg{padding:10px;border-bottom:1px solid #f1f5f9;margin-bottom:8px}
 .msg:last-child{border-bottom:none}
@@ -145,7 +153,23 @@ async function refreshStatus(){
   
   try {
     const res = await fetch('/api/bot-status');
+    
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    }
+    
     const data = await res.json();
+    
+    if (data.initializing) {
+      statusEl.innerHTML = '⏳ Bot is initializing... Please wait.';
+      statusEl.className = 'status warning';
+      botInfoEl.style.display = 'none';
+      webhookInfoEl.style.display = 'none';
+      
+      // Retry in 2 seconds if still initializing
+      setTimeout(refreshStatus, 2000);
+      return;
+    }
     
     if (data.connected) {
       statusEl.innerHTML = '✅ Bot is running and listening for messages';
@@ -161,7 +185,7 @@ async function refreshStatus(){
       }
       
       if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-        webhookBtn.style.display = 'inline-block';
+        if (webhookBtn) webhookBtn.style.display = 'inline-block';
       }
     } else {
       statusEl.innerHTML = `❌ Bot error: ${data.error}`;
@@ -170,8 +194,12 @@ async function refreshStatus(){
       webhookInfoEl.style.display = 'none';
     }
   } catch (e) {
-    statusEl.innerHTML = '❌ Cannot connect to server';
+    console.error('Status check error:', e);
+    statusEl.innerHTML = '❌ Cannot connect to server: ' + e.message;
     statusEl.className = 'status error';
+    
+    // Retry in 5 seconds
+    setTimeout(refreshStatus, 5000);
   }
 }
 
@@ -258,9 +286,9 @@ def index():
 def webhook():
     """Handle incoming webhooks from Telegram"""
     try:
-        if not telegram_app:
-            logger.error("Telegram app not initialized")
-            return "Bot not ready", 400
+        if not telegram_app or not initialization_complete:
+            logger.error("Telegram app not ready yet")
+            return "Bot not ready", 503
             
         # Get the JSON data
         json_data = request.get_json()
@@ -292,14 +320,12 @@ def api_messages():
     with lock:
         return jsonify({'messages': list(messages)})
 
-    
-  
 @app.route('/setup-webhook')
 def setup_webhook():
     """Manual webhook setup page"""
     try:
-        if not telegram_app:
-            return "Bot not initialized", 500
+        if not telegram_app or not initialization_complete:
+            return "Bot not initialized yet", 503
         
         webhook_url = request.url_root.rstrip('/') + '/webhook'
         
@@ -324,6 +350,23 @@ def setup_webhook():
 def api_bot_status():
     """Check bot status"""
     try:
+        # Check if initialization is still in progress
+        if not initialization_complete:
+            return jsonify({
+                'initializing': True,
+                'connected': False,
+                'message': 'Bot is still initializing...'
+            })
+        
+        # Check if initialization failed
+        if initialization_error:
+            return jsonify({
+                'connected': False,
+                'error': f'Initialization failed: {initialization_error}',
+                'initializing': False
+            })
+        
+        # Get message count
         with lock:
             msg_count = len(messages)
         
@@ -340,35 +383,44 @@ def api_bot_status():
                         'url': webhook_data.url,
                         'pending_update_count': webhook_data.pending_update_count
                     }
+                except Exception as webhook_error:
+                    logger.warning(f"Could not get webhook info: {webhook_error}")
+                    webhook_info = {'url': 'Unable to fetch', 'pending_update_count': 0}
                 finally:
                     loop.close()
             except Exception as e:
                 logger.error(f"Error getting webhook info: {e}")
+                webhook_info = {'url': 'Error fetching', 'pending_update_count': 0}
             
             return jsonify({
                 'connected': True,
                 'username': bot_info.get('username', 'Unknown'),
                 'first_name': bot_info.get('first_name', 'Unknown'),
                 'message_count': msg_count,
-                'webhook_info': webhook_info
+                'webhook_info': webhook_info,
+                'initializing': False
             })
         else:
             return jsonify({
                 'connected': False,
-                'error': 'Bot not initialized yet'
+                'error': 'Bot not initialized properly',
+                'initializing': False
             })
+            
     except Exception as e:
+        logger.error(f"Error in bot status: {e}")
         return jsonify({
             'connected': False,
-            'error': str(e)
-        })
+            'error': f'Status check failed: {str(e)}',
+            'initializing': False
+        }), 500
 
 @app.route('/api/set-webhook', methods=['POST'])
 def api_set_webhook():
     """Set webhook URL"""
     try:
-        if not telegram_app:
-            return jsonify({'success': False, 'error': 'Bot not initialized'})
+        if not telegram_app or not initialization_complete:
+            return jsonify({'success': False, 'error': 'Bot not initialized yet'})
         
         # Get the current host
         webhook_url = request.url_root.rstrip('/') + '/webhook'
@@ -464,16 +516,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Initialize the Telegram app when the module loads
 import asyncio
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-try:
-    success = loop.run_until_complete(init_telegram_app())
-    if success:
-        logger.info("🚀 Telegram bot initialized successfully")
-    else:
-        logger.error("❌ Failed to initialize Telegram bot")
-finally:
-    loop.close()
+
+def initialize_bot_sync():
+    """Initialize bot synchronously for better startup handling"""
+    global initialization_complete, initialization_error
+    
+    logger.info("🚀 Starting bot initialization...")
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        success = loop.run_until_complete(init_telegram_app())
+        if success:
+            logger.info("✅ Telegram bot initialized successfully")
+        else:
+            logger.error("❌ Failed to initialize Telegram bot")
+    except Exception as e:
+        logger.error(f"❌ Initialization error: {e}")
+        initialization_error = str(e)
+        initialization_complete = True
+    finally:
+        loop.close()
+
+# Initialize on startup
+initialize_bot_sync()
 
 if __name__ == '__main__':
     logger.info("🎬 Starting Flask application...")
