@@ -107,7 +107,6 @@ button.danger:hover{background:#b91c1c}
 <div id="msgs"></div>
 <div class="controls">
 <button onclick="save()">💾 Export</button>
-<button class="secondary" onclick="clearServer()">🗑️ Clear</button>
 <button class="secondary" onclick="refreshStatus()">🔄 Refresh</button>
 </div>
 </div>
